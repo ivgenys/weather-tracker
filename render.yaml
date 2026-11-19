@@ -1,3 +1,5 @@
+# Render Blueprint matching the settings of the live service.
+# The Python version comes from .python-version.
 services:
   - type: web
     name: weather-tracker
@@ -7,8 +9,3 @@ services:
     startCommand: gunicorn --chdir src app:app
     healthCheckPath: /health
     autoDeploy: true
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: SEED_ON_BOOT
-        value: "true"

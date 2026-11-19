@@ -1,10 +1,15 @@
+import argparse
+import time
 from datetime import datetime, timezone
+
 import requests
+
 from messaging import ROUTING_KEY
 from models import WeatherObservation, db
 from monitoring import metrics_registry
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_SOURCE = "open-meteo"
 
 CITY_COORDINATES = {
     "Boulder": {"latitude": 40.0150, "longitude": -105.2705},
@@ -18,43 +23,59 @@ CITY_COORDINATES = {
 }
 
 
-def resolve_city_coordinates(city):
-    normalized = (city or "Boulder").strip()
-    for known_city, coords in CITY_COORDINATES.items():
-        if known_city.lower() == normalized.lower():
-            return known_city, coords
-    return normalized, CITY_COORDINATES["Boulder"]
+class UnknownCityError(ValueError):
+    pass
+
+
+def canonical_city_name(city):
+    """Matches a known city ignoring case; otherwise returns the trimmed input."""
+    cleaned = str(city or "").strip()
+    for known_city in CITY_COORDINATES:
+        if known_city.lower() == cleaned.lower():
+            return known_city
+    return cleaned
+
+
+def coordinates_for(city):
+    name = canonical_city_name(city)
+    if name not in CITY_COORDINATES:
+        raise UnknownCityError(f"No coordinates configured for city '{city}'")
+    return name, CITY_COORDINATES[name]
 
 
 def parse_observed_timestamp(raw_time):
+    """Parses an ISO timestamp into a naive UTC datetime."""
     if not raw_time:
         return datetime.now(timezone.utc).replace(tzinfo=None)
-    cleaned = raw_time.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(cleaned)
+    parsed = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
     if parsed.tzinfo is not None:
         return parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
 
 
-def fetch_open_meteo_reading(latitude, longitude, http_get=requests.get):
-    """Fetches current weather metrics from the public Open-Meteo REST API."""
+def fetch_open_meteo_reading(latitude, longitude, http_get=None):
+    """Fetches the current reading for a location from the Open-Meteo REST API."""
     params = {
         "latitude": latitude,
         "longitude": longitude,
         "current": "temperature_2m,relative_humidity_2m,wind_speed_10m",
         "timezone": "UTC",
     }
-    response = http_get(OPEN_METEO_URL, params=params, timeout=8)
+    response = (http_get or requests.get)(OPEN_METEO_URL, params=params, timeout=8)
     response.raise_for_status()
-    payload = response.json()
-    current = payload.get("current", {})
-    if "temperature_2m" not in current:
-        raise ValueError("Open-Meteo response missing current.temperature_2m")
+    current = response.json().get("current", {})
+    missing = [
+        field
+        for field in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m")
+        if current.get(field) is None
+    ]
+    if missing:
+        raise ValueError(f"Open-Meteo response is missing {', '.join(missing)}")
 
     return {
         "temperature_c": float(current["temperature_2m"]),
-        "humidity_pct": float(current.get("relative_humidity_2m", 0.0)),
-        "wind_speed_kmh": float(current.get("wind_speed_10m", 0.0)),
+        "humidity_pct": float(current["relative_humidity_2m"]),
+        "wind_speed_kmh": float(current["wind_speed_10m"]),
         "observed_at": parse_observed_timestamp(current.get("time")),
     }
 
@@ -65,13 +86,13 @@ def store_observation_and_publish(
     humidity_pct,
     wind_speed_kmh,
     observed_at=None,
-    source="open-meteo",
+    source=OPEN_METEO_SOURCE,
     broker=None,
 ):
-    timestamp = observed_at or datetime.now(timezone.utc).replace(tzinfo=None)
+    """Saves one raw reading, then announces it so the analyzer can update the day."""
     record = WeatherObservation(
         city=city,
-        observed_at=timestamp,
+        observed_at=observed_at or datetime.now(timezone.utc).replace(tzinfo=None),
         temperature_c=float(temperature_c),
         humidity_pct=float(humidity_pct),
         wind_speed_kmh=float(wind_speed_kmh),
@@ -88,49 +109,80 @@ def store_observation_and_publish(
                 "observation_id": record.id,
                 "city": record.city,
                 "summary_date": record.observed_at.date().isoformat(),
-                "temperature_c": record.temperature_c,
             },
         )
     return record
 
 
-def collect_city_weather(
-    city="Boulder",
-    broker=None,
-    metrics=None,
-    http_get=requests.get,
-):
-    canonical_city, coords = resolve_city_coordinates(city)
+def collect_city_weather(city, broker=None, metrics=None, http_get=None):
+    """Collects one city from Open-Meteo. Returns (observation, created).
+
+    Open-Meteo refreshes its current reading every 15 minutes. If we already
+    stored the reading for that timestamp, return it instead of saving a copy
+    that would skew the daily average.
+    """
     active_metrics = metrics or metrics_registry
+    name, coords = coordinates_for(city)
     try:
         reading = fetch_open_meteo_reading(
             coords["latitude"], coords["longitude"], http_get=http_get
         )
-        record = store_observation_and_publish(
-            city=canonical_city,
-            temperature_c=reading["temperature_c"],
-            humidity_pct=reading["humidity_pct"],
-            wind_speed_kmh=reading["wind_speed_kmh"],
-            observed_at=reading["observed_at"],
-            source="open-meteo",
-            broker=broker,
-        )
-        active_metrics.record_collection(success=True)
-        return record
     except Exception:
         active_metrics.record_collection(success=False)
         raise
 
+    existing = WeatherObservation.query.filter_by(
+        city=name, observed_at=reading["observed_at"], source=OPEN_METEO_SOURCE
+    ).first()
+    if existing is not None:
+        active_metrics.record_collection(success=True)
+        return existing, False
+
+    record = store_observation_and_publish(
+        city=name,
+        temperature_c=reading["temperature_c"],
+        humidity_pct=reading["humidity_pct"],
+        wind_speed_kmh=reading["wind_speed_kmh"],
+        observed_at=reading["observed_at"],
+        broker=broker,
+    )
+    active_metrics.record_collection(success=True)
+    return record, True
+
+
+def collect_all_cities(broker=None, metrics=None):
+    for city in CITY_COORDINATES:
+        try:
+            observation, created = collect_city_weather(city, broker=broker, metrics=metrics)
+        except Exception as exc:
+            print(f"{city}: collection failed ({exc})", flush=True)
+            continue
+        state = "saved" if created else "already stored"
+        print(
+            f"{city}: {observation.temperature_c:.1f} C, "
+            f"{observation.humidity_pct:.0f}% humidity, "
+            f"{observation.wind_speed_kmh:.1f} km/h wind ({state})",
+            flush=True,
+        )
+
 
 if __name__ == "__main__":
-    from app import create_app
+    from webapp import create_app
 
-    application = create_app(seed_on_boot=False)
+    parser = argparse.ArgumentParser(description="Weather Tracker collector")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=0,
+        help="seconds between collection runs; 0 collects once and exits",
+    )
+    args = parser.parse_args()
+
+    application = create_app(seed_on_boot=False, embedded_analyzer=False)
     with application.app_context():
-        active_broker = application.extensions["event_broker"]
-        for target_city in ("Boulder", "Denver", "Colorado Springs", "Fort Collins"):
-            obs = collect_city_weather(target_city, broker=active_broker)
-            print(
-                f"Collected {obs.city}: {obs.temperature_c:.1f} C, "
-                f"humidity {obs.humidity_pct:.0f}%, wind {obs.wind_speed_kmh:.1f} km/h"
-            )
+        while True:
+            collect_all_cities(broker=application.extensions["event_broker"])
+            db.session.remove()
+            if args.interval <= 0:
+                break
+            time.sleep(args.interval)

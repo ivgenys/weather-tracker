@@ -1,3 +1,16 @@
+# Local stack: PostgreSQL, RabbitMQ, the web app, and the collector and analyzer
+# as separate processes. Start it with: docker compose up --build
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
+  RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
+
+x-app-depends: &app-depends
+  postgres:
+    condition: service_healthy
+  rabbitmq:
+    condition: service_healthy
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -5,16 +18,23 @@ services:
       POSTGRES_DB: weather_tracker
       POSTGRES_USER: weather
       POSTGRES_PASSWORD: weather_password
-    ports:
-      - "5432:5432"
     volumes:
       - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U weather -d weather_tracker"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   rabbitmq:
     image: rabbitmq:3.12-management-alpine
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "15672:15672" # management UI, guest / guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
 
   web:
     build: .
@@ -22,28 +42,19 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
-      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
-    depends_on:
-      - postgres
-      - rabbitmq
+      <<: *app-env
+      EMBEDDED_ANALYZER: "false" # the analyzer service below consumes the queue
+      SEED_ON_BOOT: "false" # the collector service below fetches the data
+    depends_on: *app-depends
 
   collector:
     build: .
-    command: python src/collector.py
-    environment:
-      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
-      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
-    depends_on:
-      - postgres
-      - rabbitmq
+    command: python src/collector.py --interval 900
+    environment: *app-env
+    depends_on: *app-depends
 
   analyzer:
     build: .
     command: python src/analyzer.py --worker
-    environment:
-      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
-      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
-    depends_on:
-      - postgres
-      - rabbitmq
+    environment: *app-env
+    depends_on: *app-depends

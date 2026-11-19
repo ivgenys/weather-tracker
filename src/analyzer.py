@@ -1,134 +1,148 @@
 import argparse
-from datetime import date, datetime, timezone
-from models import DailyWeatherSummary, WeatherObservation, db
+import logging
+import sys
+from datetime import date, datetime, time, timezone
+
+from sqlalchemy.exc import IntegrityError
+
 from messaging import build_event_broker
+from models import DailyWeatherSummary, WeatherObservation, db
 from monitoring import metrics_registry
+
+logger = logging.getLogger(__name__)
+
+FREEZE_AT_OR_BELOW_C = 0.0
+HEAT_AT_OR_ABOVE_C = 32.0
+HIGH_WIND_AT_OR_ABOVE_KMH = 40.0
 
 
 def classify_weather_alert(min_temp_c, max_temp_c, max_wind_kmh):
-    if min_temp_c <= 0.0:
+    """Returns one alert per day. Freeze wins over heat, heat wins over wind."""
+    if min_temp_c <= FREEZE_AT_OR_BELOW_C:
         return "FREEZE_WARNING"
-    if max_temp_c >= 32.0:
+    if max_temp_c >= HEAT_AT_OR_ABOVE_C:
         return "HEAT_ADVISORY"
-    if max_wind_kmh >= 40.0:
+    if max_wind_kmh >= HIGH_WIND_AT_OR_ABOVE_KMH:
         return "HIGH_WIND_ADVISORY"
     return "NORMAL"
 
 
 def compute_daily_metrics(observations):
-    """Pure aggregation function computing daily statistics and weather alerts."""
+    """Aggregates one city's readings for one day. No database or network access."""
     if not observations:
         return None
 
-    temps = [float(item["temperature_c"]) for item in observations]
-    humidities = [float(item["humidity_pct"]) for item in observations]
-    winds = [float(item["wind_speed_kmh"]) for item in observations]
+    temps = [float(o["temperature_c"]) for o in observations]
+    humidities = [float(o["humidity_pct"]) for o in observations]
+    winds = [float(o["wind_speed_kmh"]) for o in observations]
 
-    avg_temp = round(sum(temps) / len(temps), 1)
     min_temp = round(min(temps), 1)
     max_temp = round(max(temps), 1)
-    avg_humidity = round(sum(humidities) / len(humidities), 1)
     max_wind = round(max(winds), 1)
-
     return {
-        "avg_temp_c": avg_temp,
+        "avg_temp_c": round(sum(temps) / len(temps), 1),
         "min_temp_c": min_temp,
         "max_temp_c": max_temp,
-        "avg_humidity_pct": avg_humidity,
+        "avg_humidity_pct": round(sum(humidities) / len(humidities), 1),
         "max_wind_kmh": max_wind,
         "sample_count": len(observations),
         "alert_status": classify_weather_alert(min_temp, max_temp, max_wind),
     }
 
 
-def recompute_city_summary(city, target_date=None, metrics=None):
-    summary_day = target_date or date.today()
-    if isinstance(summary_day, str):
-        summary_day = date.fromisoformat(summary_day)
-
-    day_start = datetime(summary_day.year, summary_day.month, summary_day.day, 0, 0, 0)
-    day_end = datetime(summary_day.year, summary_day.month, summary_day.day, 23, 59, 59)
-
-    rows = (
-        WeatherObservation.query.filter(
-            WeatherObservation.city == city,
-            WeatherObservation.observed_at >= day_start,
-            WeatherObservation.observed_at <= day_end,
-        )
-        .order_by(WeatherObservation.observed_at.asc())
-        .all()
-    )
-    if not rows:
-        return None
-
-    computed = compute_daily_metrics([row.to_dict() for row in rows])
+def _upsert_summary(city, summary_day, metrics_for_day):
     summary = DailyWeatherSummary.query.filter_by(
         city=city, summary_date=summary_day
     ).first()
-    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-
     if summary is None:
-        summary = DailyWeatherSummary(
-            city=city,
-            summary_date=summary_day,
-            **computed,
-            updated_at=now_utc,
-        )
+        summary = DailyWeatherSummary(city=city, summary_date=summary_day)
         db.session.add(summary)
-    else:
-        for field, value in computed.items():
-            setattr(summary, field, value)
-        summary.updated_at = now_utc
-
+    for field, value in metrics_for_day.items():
+        setattr(summary, field, value)
+    summary.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     db.session.commit()
-    active_metrics = metrics or metrics_registry
-    active_metrics.record_analysis()
+    return summary
+
+
+def recompute_city_summary(city, target_date=None, metrics=None):
+    """Rebuilds the summary row for (city, UTC day) from the raw observations.
+
+    It always recomputes from scratch, so handling the same event twice gives
+    the same row.
+    """
+    summary_day = target_date or datetime.now(timezone.utc).date()
+    if isinstance(summary_day, str):
+        summary_day = date.fromisoformat(summary_day)
+
+    rows = WeatherObservation.query.filter(
+        WeatherObservation.city == city,
+        WeatherObservation.observed_at >= datetime.combine(summary_day, time.min),
+        WeatherObservation.observed_at <= datetime.combine(summary_day, time.max),
+    ).all()
+    if not rows:
+        return None
+
+    metrics_for_day = compute_daily_metrics([row.to_dict() for row in rows])
+    try:
+        summary = _upsert_summary(city, summary_day, metrics_for_day)
+    except IntegrityError:
+        # Another worker inserted the same (city, day) first; update its row.
+        db.session.rollback()
+        summary = _upsert_summary(city, summary_day, metrics_for_day)
+
+    (metrics or metrics_registry).record_analysis()
     return summary
 
 
 def recompute_all_summaries(metrics=None):
-    pairs = (
-        db.session.query(WeatherObservation.city, WeatherObservation.observed_at)
-        .all()
-    )
-    distinct_targets = {(city, ts.date()) for city, ts in pairs if ts is not None}
-    results = []
-    for city, summary_day in sorted(distinct_targets):
-        updated = recompute_city_summary(city, summary_day, metrics=metrics)
-        if updated is not None:
-            results.append(updated)
-    return results
+    pairs = db.session.query(
+        WeatherObservation.city, WeatherObservation.observed_at
+    ).all()
+    targets = sorted({(city, observed_at.date()) for city, observed_at in pairs})
+    return [recompute_city_summary(city, day, metrics=metrics) for city, day in targets]
 
 
 def make_event_handler(flask_app, metrics=None):
-    def _handle_event(payload):
+    """Builds the callback that runs when a weather.collected event arrives."""
+
+    def handle_event(payload):
         city = payload.get("city")
-        observed_date = payload.get("summary_date")
         if not city:
             return
         with flask_app.app_context():
-            recompute_city_summary(city, observed_date, metrics=metrics)
+            summary = recompute_city_summary(city, payload.get("summary_date"), metrics=metrics)
+            if summary is not None:
+                logger.info(
+                    "Updated %s %s: %d readings, %s",
+                    summary.city, summary.summary_date, summary.sample_count, summary.alert_status,
+                )
 
-    return _handle_event
+    return handle_event
 
 
 if __name__ == "__main__":
-    from app import create_app
+    from webapp import create_app
 
-    parser = argparse.ArgumentParser(description="Weather Tracker Data Analyzer")
+    parser = argparse.ArgumentParser(description="Weather Tracker analyzer")
     parser.add_argument(
         "--worker",
         action="store_true",
-        help="Run continuous RabbitMQ consumer worker loop.",
+        help="consume weather.collected events from RabbitMQ until stopped",
     )
     args = parser.parse_args()
 
-    application = create_app(seed_on_boot=False)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
+    logging.getLogger("pika").setLevel(logging.WARNING)
+    application = create_app(seed_on_boot=False, embedded_analyzer=False)
     if args.worker:
         broker = build_event_broker(metrics=metrics_registry)
-        if hasattr(broker, "consume_forever"):
-            broker.consume_forever(make_event_handler(application, metrics_registry))
+        if not hasattr(broker, "start_consumer_thread"):
+            sys.exit("Set RABBIT_URL to run the analyzer as a queue worker.")
+        logger.info("Waiting for weather.collected events")
+        worker = broker.start_consumer_thread(
+            make_event_handler(application, metrics_registry)
+        )
+        worker.join()
     else:
         with application.app_context():
-            summaries = recompute_all_summaries(metrics=metrics_registry)
-            print(f"Recomputed {len(summaries)} daily weather summaries.")
+            print(f"Recomputed {len(recompute_all_summaries())} daily summaries.")

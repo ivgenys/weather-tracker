@@ -1,50 +1,102 @@
 # Weather Tracker
 
-**Live Production Deployment:** https://weather-tracker-gxaw.onrender.com
+Live app: https://weather-tracker-gxaw.onrender.com
 
-Weather Tracker is an event-driven web application, data collection pipeline, and statistical weather analyzer built for *CSCA 5028: Applications of Software Architecture for Big Data*. It ingests real-time meteorological observations from the public [Open-Meteo REST API](https://open-meteo.com/), persists raw readings and daily pre-aggregated summaries in a relational SQL database (PostgreSQL in distributed deployments, SQLite for zero-config local runs), coordinates asynchronous analysis over RabbitMQ (`weather.events` topic exchange), and exposes both a browser reporting dashboard and REST/Prometheus operational endpoints.
+Weather Tracker collects current weather readings for a few US cities from the
+[Open-Meteo API](https://open-meteo.com/), stores them, and keeps a daily summary
+per city (average, minimum and maximum temperature, average humidity, peak wind)
+with a freeze, heat or high-wind alert. You can view the data in a web dashboard
+or through a small REST API.
 
----
+Course project for CSCA 5028, Applications of Software Architecture for Big Data.
 
-## Architecture & A-Level Rubric Coverage
+## How it works
 
-| Rubric Requirement | Implementation in Repository |
+1. The **collector** (`src/collector.py`) asks Open-Meteo for the current reading
+   of a city and saves it as a row in `weather_observations`.
+2. It then publishes a `weather.collected` event.
+3. The **analyzer** (`src/analyzer.py`) receives the event, recomputes that city's
+   summary for that UTC day from the raw rows, and saves it in
+   `daily_weather_summaries`.
+4. The **web app** (`src/webapp.py`) serves the dashboard, the REST API, and the
+   `/health` and `/metrics` endpoints.
+
+Events go through RabbitMQ when `RABBIT_URL` is set. Without it they are handed
+to the analyzer inside the same process, through the same publish/subscribe
+interface (`src/messaging.py`).
+
+## Where each rubric item is
+
+| Rubric item | Where to look |
 | :--- | :--- |
-| **1. Web application (basic form, reporting)** | `src/app.py` (`GET /` dashboard with city filter, live Open-Meteo fetch form `POST /collect`, custom observation form `POST /observations`, and daily summary + raw observation tables) |
-| **2. Data collection** | `src/collector.py` (`fetch_open_meteo_reading`, `collect_city_weather`, standalone CLI worker) |
-| **3. Data analyzer** | `src/analyzer.py` (`compute_daily_metrics`, `recompute_city_summary`, freeze/wind/heat alert classification, standalone `--worker` consumer) |
-| **4. Unit tests** | `tests/test_unit.py` (7 isolated unit tests covering aggregation math, alert thresholds, URI normalization, timestamp parsing, and metrics registry) |
-| **5. Data persistence** | `src/models.py` (`WeatherObservation`, `DailyWeatherSummary` via SQLAlchemy) + `migrations/001_initial_schema.sql` |
-| **6. REST collaboration / API endpoints** | `GET /api/observations`, `POST /api/observations`, `GET /api/summaries`, `POST /api/collect` |
-| **7. Production environment** | Hosted on Render (`https://weather-tracker-gxaw.onrender.com`) via Gunicorn (`Procfile`, `render.yaml`, `Dockerfile`, `docker-compose.yml`) |
-| **8. Integration tests** | `tests/test_integration.py` (5 end-to-end HTTP + SQL database + event bus integration tests) |
-| **9. Mock objects, fakes, and spies** | `tests/test_doubles.py` (`MagicMock` for Open-Meteo HTTP client, `InMemoryEventBroker` Fake, `SpyEventBroker` Spy, and `patch` simulating RabbitMQ failure) |
-| **10. Continuous integration** | `.github/workflows/ci.yml` (GitHub Actions workflow with PostgreSQL + RabbitMQ services running `pytest -v` on every push/PR) |
-| **11. Production monitoring / instrumenting** | `src/monitoring.py` + `GET /health` (DB liveness check), `GET /metrics` (Prometheus exposition), and `GET /api/metrics` (JSON telemetry) |
-| **12. Event collaboration / messaging** | `src/messaging.py` (`RabbitEventBroker` using `pika` durable queues and manual `basic_ack`, with automatic `InMemoryEventBroker` fallback) |
-| **13. Continuous delivery** | `render.yaml` (`autoDeploy: true` on `main`) + `.github/workflows/cd.yml` post-CI deploy hook & live health smoke verification |
+| Web application: form and reporting | `src/webapp.py`, `src/templates/dashboard.html` |
+| Data collection | `src/collector.py` |
+| Data analyzer | `src/analyzer.py` |
+| Unit tests | `tests/test_unit.py` |
+| Data persistence | `src/models.py`, `migrations/001_initial_schema.sql` |
+| REST collaboration or API endpoint | `/api/observations`, `/api/summaries`, `/api/collect` in `src/webapp.py`; the collector calls the Open-Meteo REST API |
+| Product environment | Render web service at the URL above, `render.yaml` |
+| Integration tests | `tests/test_integration.py`, `tests/test_rabbitmq.py` |
+| Mock objects or test doubles | `tests/test_doubles.py` (mock HTTP client, fake broker, spy broker) |
+| Continuous integration | `.github/workflows/ci.yml` |
+| Production monitoring | `src/monitoring.py`, `/health`, `/metrics`, `/api/metrics` |
+| Event collaboration messaging | `src/messaging.py` |
+| Continuous delivery | Render deploys `main`; `.github/workflows/cd.yml` checks the deployed commit |
 
----
-
-## Local Quick Start
+## Run the tests
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-# Run automated unit, integration, and mock/fake/spy test suites
 pytest -v
+```
 
-# Run standalone data collector (optional)
-python src/collector.py
+The tests use a temporary SQLite database by default. The two RabbitMQ tests are
+skipped unless a broker is available. To run everything the way CI does, point
+the tests at PostgreSQL and RabbitMQ:
 
-# Start web server locally on http://localhost:8000
+```bash
+TEST_DATABASE_URL=postgresql://weather:weather_password@localhost:5432/weather_tracker_test \
+TEST_RABBIT_URL=amqp://guest:guest@localhost:5672/%2F \
+pytest -v
+```
+
+## Run the app
+
+Single process, SQLite, no broker needed:
+
+```bash
 gunicorn --chdir src --bind 0.0.0.0:8000 app:app
 ```
 
-To run the full multi-container stack (PostgreSQL 15 + RabbitMQ 3.12 + Web + Collector + Analyzer worker):
+Full stack with PostgreSQL, RabbitMQ, and the collector and analyzer as separate
+processes:
 
 ```bash
 docker compose up --build
 ```
+
+Then open http://localhost:8000.
+
+## API
+
+| Method and path | What it does |
+| :--- | :--- |
+| `GET /api/observations?city=&limit=` | Latest raw readings |
+| `POST /api/observations` | Store a reading: `city`, `temperature_c`, `humidity_pct`, `wind_speed_kmh`, optional `observed_at` |
+| `GET /api/summaries?city=` | Daily summaries |
+| `POST /api/collect` | Collect the current Open-Meteo reading for `city` |
+| `GET /health` | Database check, deployed commit, which event broker is in use |
+| `GET /metrics`, `GET /api/metrics` | Request and pipeline counters (Prometheus text, JSON) |
+
+## What runs in production
+
+The Render deployment is one free web service. It has no `DATABASE_URL` or
+`RABBIT_URL` configured, so it uses SQLite on the instance disk and handles
+events in-process. Render clears that disk on every restart or deploy, and the
+app collects a first reading for three cities when it starts with an empty
+database. There is no background worker on the free plan, so new readings are
+collected when someone presses Collect or calls `POST /api/collect`.
+
+Setting `DATABASE_URL` (PostgreSQL) and `RABBIT_URL` (RabbitMQ) on the service
+switches both without code changes; `/health` shows which broker is active.

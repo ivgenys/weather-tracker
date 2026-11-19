@@ -3,7 +3,7 @@ import time
 
 
 class MetricsRegistry:
-    """Thread-safe application telemetry and production monitoring registry."""
+    """Request and pipeline counters behind /metrics. Safe to update from several threads."""
 
     def __init__(self):
         self._lock = threading.Lock()

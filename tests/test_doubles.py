@@ -1,135 +1,134 @@
-import os
+"""Tests that replace the outside world with test doubles.
 
-os.environ.setdefault("SKIP_DEFAULT_APP_INIT", "true")
-
+Mock: the Open-Meteo HTTP client. Fake: InMemoryEventBroker. Spy: SpyEventBroker.
+"""
 from unittest.mock import MagicMock, patch
-import pytest
-from app import create_app
+
+import requests
+
 from collector import collect_city_weather, fetch_open_meteo_reading
 from messaging import InMemoryEventBroker, RabbitEventBroker
-from models import DailyWeatherSummary, WeatherObservation, db
+from models import DailyWeatherSummary, WeatherObservation
 from monitoring import MetricsRegistry
 
 
+def open_meteo_response(time="2026-11-18T16:00", temperature=11.3, humidity=38.0, wind=19.2):
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "current": {
+            "time": time,
+            "temperature_2m": temperature,
+            "relative_humidity_2m": humidity,
+            "wind_speed_10m": wind,
+        }
+    }
+    return response
+
+
 class SpyEventBroker:
-    """Test Spy recording all published routing keys and payloads while delegating."""
+    """Records every publish call, then passes it on to the real broker."""
 
     def __init__(self, delegate):
         self._delegate = delegate
         self.calls = []
 
     def subscribe(self, routing_key, callback):
-        return self._delegate.subscribe(routing_key, callback)
+        self._delegate.subscribe(routing_key, callback)
 
     def publish(self, routing_key, payload):
         self.calls.append((routing_key, dict(payload)))
-        return self._delegate.publish(routing_key, payload)
+        self._delegate.publish(routing_key, payload)
 
 
-@pytest.fixture()
-def app_ctx(tmp_path):
-    db_file = tmp_path / "doubles_test.sqlite3"
-    metrics = MetricsRegistry()
-    fake_broker = InMemoryEventBroker(metrics=metrics)
-    spy_broker = SpyEventBroker(fake_broker)
-    flask_app = create_app(
-        config_overrides={
-            "TESTING": True,
-            "SQLALCHEMY_DATABASE_URI": f"sqlite:///{db_file}",
-        },
-        broker=spy_broker,
-        metrics=metrics,
-        seed_on_boot=False,
-    )
-    with flask_app.app_context():
-        yield flask_app, fake_broker, spy_broker, metrics
-        db.session.remove()
-        db.drop_all()
+def test_fetch_sends_the_expected_request_and_parses_the_reply():
+    http_get = MagicMock(return_value=open_meteo_response())
 
+    reading = fetch_open_meteo_reading(40.0150, -105.2705, http_get=http_get)
 
-def test_mock_open_meteo_http_client():
-    """Demonstrates a Mock object replacing external HTTP network I/O."""
-    mock_response = MagicMock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
-        "current": {
-            "time": "2026-11-18T16:00:00Z",
-            "temperature_2m": 11.3,
-            "relative_humidity_2m": 38.0,
-            "wind_speed_10m": 19.2,
-        }
-    }
-    mock_http_get = MagicMock(return_value=mock_response)
-
-    reading = fetch_open_meteo_reading(40.0150, -105.2705, http_get=mock_http_get)
-
-    mock_http_get.assert_called_once()
-    called_args, called_kwargs = mock_http_get.call_args
-    assert "api.open-meteo.com" in called_args[0]
-    assert called_kwargs["params"]["latitude"] == 40.0150
+    http_get.assert_called_once()
+    (url,), kwargs = http_get.call_args
+    assert url == "https://api.open-meteo.com/v1/forecast"
+    assert kwargs["params"]["latitude"] == 40.0150
+    assert kwargs["params"]["longitude"] == -105.2705
+    assert kwargs["timeout"] == 8
     assert reading["temperature_c"] == 11.3
     assert reading["humidity_pct"] == 38.0
     assert reading["wind_speed_kmh"] == 19.2
+    assert reading["observed_at"].isoformat() == "2026-11-18T16:00:00"
 
 
-def test_fake_broker_and_spy_verify_end_to_end_event_collaboration(app_ctx):
-    """Demonstrates both a Fake broker (InMemoryEventBroker) and a Spy (SpyEventBroker)."""
-    _app, fake_broker, spy_broker, metrics = app_ctx
+def test_collect_endpoint_stores_one_row_per_open_meteo_timestamp(env):
+    with patch("collector.requests.get", return_value=open_meteo_response()):
+        first = env.client.post("/api/collect", json={"city": "Boulder"})
+        repeat = env.client.post("/api/collect", json={"city": "Boulder"})
 
-    mock_response = MagicMock()
-    mock_response.raise_for_status.return_value = None
-    mock_response.json.return_value = {
-        "current": {
-            "time": "2026-11-18T17:00:00Z",
-            "temperature_2m": -4.2,
-            "relative_humidity_2m": 71.0,
-            "wind_speed_10m": 25.0,
-        }
-    }
-    mock_get = MagicMock(return_value=mock_response)
-
-    saved = collect_city_weather(
-        "Fort Collins",
-        broker=spy_broker,
-        metrics=metrics,
-        http_get=mock_get,
-    )
-
-    assert saved.id is not None
-    assert WeatherObservation.query.filter_by(city="Fort Collins").count() == 1
-
-    # Verify Spy recorded exact message publication
-    assert len(spy_broker.calls) == 1
-    routing_key, payload = spy_broker.calls[0]
-    assert routing_key == "weather.collected"
-    assert payload["city"] == "Fort Collins"
-    assert payload["observation_id"] == saved.id
-
-    # Verify Fake broker dispatched event to analyzer subscriber and persisted summary
-    assert len(fake_broker.published_messages) == 1
-    summary = DailyWeatherSummary.query.filter_by(city="Fort Collins").first()
-    assert summary is not None
-    assert summary.min_temp_c == -4.2
-    assert summary.alert_status == "FREEZE_WARNING"
+    assert first.status_code == 201
+    assert repeat.status_code == 200
+    assert repeat.get_json()["id"] == first.get_json()["id"]
+    assert len(env.broker.published_messages) == 1
+    summary = env.client.get("/api/summaries?city=Boulder").get_json()[0]
+    assert summary["sample_count"] == 1
+    assert summary["avg_temp_c"] == 11.3
 
 
-def test_rabbit_event_broker_falls_back_gracefully_when_pika_mock_raises():
-    """Uses unittest.mock.patch to simulate a RabbitMQ broker outage and verify fallback."""
+def test_collect_endpoint_reports_upstream_failure_without_storing_data(env):
+    with patch("collector.requests.get", side_effect=requests.ConnectionError("down")):
+        response = env.client.post("/api/collect", json={"city": "Denver"})
+
+    assert response.status_code == 502
+    with env.app.app_context():
+        assert WeatherObservation.query.count() == 0
+    assert env.metrics.snapshot()["collector_errors_total"] == 1
+
+
+def test_collect_endpoint_rejects_a_city_without_coordinates(env):
+    with patch("collector.requests.get") as http_get:
+        response = env.client.post("/api/collect", json={"city": "Atlantis"})
+
+    assert response.status_code == 400
+    http_get.assert_not_called()
+
+
+def test_collector_publishes_an_event_that_the_analyzer_turns_into_a_summary(make_app):
     metrics = MetricsRegistry()
-    fallback_fake = InMemoryEventBroker(metrics=metrics)
-    received = []
-    fallback_fake.subscribe("weather.collected", lambda msg: received.append(msg))
+    fake_broker = InMemoryEventBroker(metrics=metrics)
+    spy = SpyEventBroker(fake_broker)
+    app = make_app(spy, metrics)
+    http_get = MagicMock(return_value=open_meteo_response(temperature=-4.2, wind=25.0))
 
-    rabbit_broker = RabbitEventBroker(
-        "amqp://guest:guest@unreachable-broker:5672/%2F",
-        metrics=metrics,
-        fallback_broker=fallback_fake,
-    )
+    with app.app_context():
+        saved, created = collect_city_weather(
+            "Fort Collins", broker=spy, metrics=metrics, http_get=http_get
+        )
+
+        assert created is True
+        assert spy.calls == [
+            (
+                "weather.collected",
+                {
+                    "event": "weather.collected",
+                    "observation_id": saved.id,
+                    "city": "Fort Collins",
+                    "summary_date": "2026-11-18",
+                },
+            )
+        ]
+        summary = DailyWeatherSummary.query.filter_by(city="Fort Collins").one()
+        assert summary.min_temp_c == -4.2
+        assert summary.alert_status == "FREEZE_WARNING"
+
+
+def test_event_is_handled_in_process_when_rabbitmq_is_unreachable():
+    metrics = MetricsRegistry()
+    fallback = InMemoryEventBroker(metrics=metrics)
+    received = []
+    fallback.subscribe("weather.collected", received.append)
+    broker = RabbitEventBroker("amqp://guest:guest@unreachable:5672/%2F", metrics=metrics, fallback=fallback)
 
     with patch("messaging.pika.BlockingConnection", side_effect=OSError("Connection refused")):
-        rabbit_broker.publish("weather.collected", {"city": "Boulder", "temperature_c": 3.5})
+        broker.publish("weather.collected", {"city": "Boulder", "summary_date": "2026-11-18"})
 
-    assert len(received) == 1
-    assert received[0]["city"] == "Boulder"
+    assert received == [{"city": "Boulder", "summary_date": "2026-11-18"}]
     assert metrics.snapshot()["events_published_total"] == 1
     assert metrics.snapshot()["events_consumed_total"] == 1

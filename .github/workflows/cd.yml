@@ -1,40 +1,45 @@
-name: Continuous Delivery
+name: CD
+
+# Render deploys main from GitHub. After CI passes, this workflow waits until
+# production reports the commit that was just tested, and fails if it never does.
 
 on:
   workflow_run:
-    workflows: ["Continuous Integration"]
-    types:
-      - completed
-    branches: [ main ]
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  deploy-and-smoke-check:
+  verify-production:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    env:
+      PRODUCTION_URL: https://weather-tracker-gxaw.onrender.com
+      EXPECTED_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
 
     steps:
-      - name: Trigger Render Deploy Hook (if configured)
+      # Optional: set the RENDER_DEPLOY_HOOK_URL secret to deploy only from here.
+      - name: Trigger a Render deploy
         env:
           RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
         run: |
           if [ -n "$RENDER_DEPLOY_HOOK_URL" ]; then
-            curl -fsSL -X POST "$RENDER_DEPLOY_HOOK_URL"
+            curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
           else
-            echo "Render GitHub auto-deploy is active on main; skipping manual deploy hook."
+            echo "No deploy hook configured; relying on Render's GitHub auto-deploy."
           fi
 
-      - name: Verify live production health endpoint
-        env:
-          PRODUCTION_URL: https://weather-tracker-gxaw.onrender.com
+      - name: Wait for production to serve the tested commit
         run: |
-          for attempt in 1 2 3 4 5; do
-            status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$PRODUCTION_URL/")
-            if [ "$status" = "200" ]; then
-              echo "Production service responded with HTTP 200 on attempt $attempt"
+          for attempt in $(seq 1 45); do
+            body=$(curl -s --max-time 60 "$PRODUCTION_URL/health" || true)
+            echo "attempt $attempt: $body"
+            if echo "$body" | grep -q '"status":"UP"' && echo "$body" | grep -q "\"version\":\"$EXPECTED_COMMIT\""; then
+              echo "Production is healthy on $EXPECTED_COMMIT"
               exit 0
             fi
-            sleep 10
+            sleep 20
           done
-          echo "Production health verification timed out"
+          echo "Production did not report commit $EXPECTED_COMMIT as healthy within 15 minutes"
           exit 1
