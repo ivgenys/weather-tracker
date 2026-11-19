@@ -40,16 +40,23 @@ class InMemoryEventBroker:
 
 
 class RabbitEventBroker:
-    """Publishes to and consumes from a durable RabbitMQ queue."""
+    """Publishes events to a RabbitMQ exchange and consumes them from a durable queue.
+
+    Only the consumer creates the queue. The publisher sends to the exchange
+    and asks the broker to confirm that a queue took the message. If RabbitMQ
+    is unreachable, or no consumer has created the queue yet, the event is
+    handled in this process instead, so it is never dropped.
+    """
 
     def __init__(self, rabbit_url, metrics=None, fallback=None, queue_name=QUEUE_NAME):
         self.rabbit_url = rabbit_url
         self.queue_name = queue_name
+        self.consumer_ready = threading.Event()
         self._metrics = metrics
         self._fallback = fallback or InMemoryEventBroker(metrics=metrics)
 
     def subscribe(self, routing_key, callback):
-        # Only used if RabbitMQ is unreachable at publish time.
+        # Called only when an event has to be handled in this process.
         self._fallback.subscribe(routing_key, callback)
 
     def _open_channel(self):
@@ -59,10 +66,6 @@ class RabbitEventBroker:
         channel = connection.channel()
         channel.exchange_declare(
             exchange=EXCHANGE_NAME, exchange_type="topic", durable=True
-        )
-        channel.queue_declare(queue=self.queue_name, durable=True)
-        channel.queue_bind(
-            exchange=EXCHANGE_NAME, queue=self.queue_name, routing_key=ROUTING_KEY
         )
         return connection, channel
 
@@ -76,6 +79,7 @@ class RabbitEventBroker:
             self._fallback.publish(routing_key, payload)
             return
         try:
+            channel.confirm_delivery()
             channel.basic_publish(
                 exchange=EXCHANGE_NAME,
                 routing_key=routing_key,
@@ -84,11 +88,20 @@ class RabbitEventBroker:
                     content_type="application/json",
                     delivery_mode=2,  # persist the message to disk
                 ),
+                mandatory=True,  # tell us if no queue took the message
             )
-            if self._metrics is not None:
-                self._metrics.record_event_published()
+        except (pika.exceptions.UnroutableError, pika.exceptions.NackError):
+            logger.warning(
+                "No queue accepted the event (is a consumer running?); "
+                "handling it in this process"
+            )
+            self._fallback.publish(routing_key, payload)
+            return
         finally:
-            connection.close()
+            if connection.is_open:
+                connection.close()
+        if self._metrics is not None:
+            self._metrics.record_event_published()
 
     def consume(self, handler, stop_event=None):
         """Handles messages one at a time until stop_event is set.
@@ -97,7 +110,12 @@ class RabbitEventBroker:
         mid-way leaves it on the queue for redelivery.
         """
         connection, channel = self._open_channel()
+        channel.queue_declare(queue=self.queue_name, durable=True)
+        channel.queue_bind(
+            exchange=EXCHANGE_NAME, queue=self.queue_name, routing_key=ROUTING_KEY
+        )
         channel.basic_qos(prefetch_count=1)
+        self.consumer_ready.set()
         try:
             for method, _properties, body in channel.consume(
                 self.queue_name, inactivity_timeout=1

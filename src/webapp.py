@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -51,15 +52,16 @@ def parse_reading(fields):
     return values, None
 
 
-def _seed_if_empty(broker, metrics):
+def _seed_if_empty(app, broker, metrics):
     """Collects a first reading for a few cities so a fresh deploy is not blank."""
-    if WeatherObservation.query.first() is not None:
-        return
-    for city in SEED_CITIES:
-        try:
-            collect_city_weather(city, broker=broker, metrics=metrics)
-        except Exception as exc:
-            logger.warning("Could not seed %s from Open-Meteo: %s", city, exc)
+    with app.app_context():
+        if WeatherObservation.query.first() is not None:
+            return
+        for city in SEED_CITIES:
+            try:
+                collect_city_weather(city, broker=broker, metrics=metrics)
+            except Exception as exc:
+                logger.warning("Could not seed %s from Open-Meteo: %s", city, exc)
 
 
 def create_app(config_overrides=None, broker=None, metrics=None, seed_on_boot=None,
@@ -96,8 +98,10 @@ def create_app(config_overrides=None, broker=None, metrics=None, seed_on_boot=No
             and not app.config.get("TESTING")
         )
     if seed_on_boot:
-        with app.app_context():
-            _seed_if_empty(broker, metrics)
+        # In the background, so a slow Open-Meteo cannot delay startup.
+        threading.Thread(
+            target=_seed_if_empty, args=(app, broker, metrics), name="seed", daemon=True
+        ).start()
 
     @app.before_request
     def start_timer():

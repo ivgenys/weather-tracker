@@ -69,6 +69,8 @@ Single process, SQLite, no broker needed:
 gunicorn --chdir src --bind 0.0.0.0:8000 app:app
 ```
 
+Gunicorn does not run on Windows. There, use `python src/app.py` instead.
+
 Full stack with PostgreSQL, RabbitMQ, and the collector and analyzer as separate
 processes:
 

@@ -4,6 +4,7 @@ Mock: the Open-Meteo HTTP client. Fake: InMemoryEventBroker. Spy: SpyEventBroker
 """
 from unittest.mock import MagicMock, patch
 
+import pika
 import requests
 
 from collector import collect_city_weather, fetch_open_meteo_reading
@@ -132,3 +133,19 @@ def test_event_is_handled_in_process_when_rabbitmq_is_unreachable():
     assert received == [{"city": "Boulder", "summary_date": "2026-11-18"}]
     assert metrics.snapshot()["events_published_total"] == 1
     assert metrics.snapshot()["events_consumed_total"] == 1
+
+
+def test_event_is_handled_in_process_when_no_queue_accepts_it():
+    fallback = InMemoryEventBroker()
+    received = []
+    fallback.subscribe("weather.collected", received.append)
+    broker = RabbitEventBroker("amqp://guest:guest@broker:5672/%2F", fallback=fallback)
+
+    with patch("messaging.pika.BlockingConnection") as connect:
+        channel = connect.return_value.channel.return_value
+        channel.basic_publish.side_effect = pika.exceptions.UnroutableError([])
+        broker.publish("weather.collected", {"city": "Denver", "summary_date": "2026-11-18"})
+
+    channel.confirm_delivery.assert_called_once()
+    assert channel.basic_publish.call_args.kwargs["mandatory"] is True
+    assert received == [{"city": "Denver", "summary_date": "2026-11-18"}]
