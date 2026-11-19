@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: weather_tracker
+      POSTGRES_USER: weather
+      POSTGRES_PASSWORD: weather_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+
+  rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  web:
+    build: .
+    command: gunicorn --chdir src --bind 0.0.0.0:8000 app:app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
+      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  collector:
+    build: .
+    command: python src/collector.py
+    environment:
+      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
+      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  analyzer:
+    build: .
+    command: python src/analyzer.py --worker
+    environment:
+      DATABASE_URL: postgresql://weather:weather_password@postgres:5432/weather_tracker
+      RABBIT_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    depends_on:
+      - postgres
+      - rabbitmq
